@@ -49,24 +49,15 @@ app.post('/scan', async (req, res) => {
     res.json({
       success: true,
       results: [
-    {
-  symbol: 'RVT',
-  name: 'Rovetan',
-  liquidity: '$24K',
-  volume: '$180K',
-  score: 91,
-  risk: 'Medium',
-},
-        {
-          symbol: 'DAI',
-          name: 'DaiDai26',
-          liquidity: '$31K',
-          volume: '$420K',
-          score: 95,
-          risk: 'Low',
-        }
-      ]
-    });
+app.post('/api/scan', async (req, res) => {
+  try {
+    const results = await getLiveScannerResults();
+    res.json({ ok: true, results });
+  } catch (err) {
+    console.error("SCAN ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
   } catch (err) {
     res.status(500).json({
       success: false,
