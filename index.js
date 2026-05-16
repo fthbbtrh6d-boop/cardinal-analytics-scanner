@@ -1,315 +1,444 @@
-import "dotenv/config";
-import express from "express";
-import cors from "cors";
+import { getCryptoPrices } from './portfolioApi.js';
+import express from 'express';
+import cors from 'cors';
+import cron from 'node-cron';
+import { v4 as uuid } from 'uuid';
+import { config } from './config.js';
+import { scanOnce } from './scanner.js';
+import { readJson, writeJson } from './store.js';
+import { sendDiscordAlert } from './alerts.js';
+import { evaluatePosition, enhanceTokenForTrade } from './tradeManager.js';
 
 const app = express();
-const PORT = 5050;
-const DEX = "https://api.dexscreener.com";
 
 app.use(cors());
 app.use(express.json());
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, status: 'API Online' });
+});
 
-const alerted = new Set();
+let lastRun = null;
 
-function envNum(name, fallback) {
-  return Number(process.env[name] || fallback);
-}
+function upsert(name, item, matcher = (a, b) => a.id === b.id) {
+  const items = readJson(name);
+  const incoming = { ...item, updatedAt: new Date().toISOString() };
+  const idx = items.findIndex(x => matcher(x, incoming));
 
-const SETTINGS = {
-  alertScore: envNum("ALERT_SCORE", 85),
-  minLiquidity: envNum("MIN_LIQUIDITY", 15000),
-  maxLiquidity: envNum("MAX_LIQUIDITY", 150000),
-  maxAgeMinutes: envNum("MAX_AGE_MINUTES", 360),
-  minVolumeLiquidityRatio: envNum("MIN_VOLUME_LIQUIDITY_RATIO", 1.5)
-};
-
-async function sendTelegramAlert(token) {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-
-  if (!botToken || !chatId) {
-    console.log("Telegram missing bot token or chat ID.");
-    return false;
+  if (idx >= 0) {
+    items[idx] = { ...items[idx], ...incoming };
+  } else {
+    items.unshift({
+      id: uuid(),
+      createdAt: new Date().toISOString(),
+      ...incoming
+    });
   }
 
-  const text = `🚨 CARDINAL SCANNER ALERT 🚨
+  writeJson(name, items);
+  return idx >= 0 ? items[idx] : items[0];
+}
 
-${token.symbol} - ${token.name}
-
-Score: ${token.score}
-Action: ${token.action}
-Signal: ${token.rugSignal}
-
-Liquidity: $${Number(token.liquidity || 0).toLocaleString()}
-24h Volume: $${Number(token.volume24h || 0).toLocaleString()}
-Volume/Liq: ${token.volumeLiquidityRatio}x
-Age: ${token.age}
-24h Change: ${token.priceChange}%
-
-Reason:
-${token.reason}
-
-Dex:
-${token.dexUrl}`;
-
-  const response = await fetch(
-    `https://api.telegram.org/bot${botToken}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        disable_web_page_preview: false
-      })
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    status: 'API Online'
+  });
+});
+app.post('/scan', async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      results: [
+        {
+          symbol: 'RVT',
+          name: 'Rovetan',
+          liquidity: '$24K',
+          volume: '$180K',
+          score: 91,
+          risk: 'Medium',
+        },
+        {
+          symbol: 'DAI',
+          name: 'DaiDai26',
+          liquidity: '$31K',
+          volume: '$420K',
+          score: 95,
+          risk: 'Low',
+        }
+      ]
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});app.post('/api/scan', async (req, res) => {
+  res.json({
+    ok: true,
+    results: [
+      {
+        symbol: 'RVT',
+        name: 'Rovetan',
+        liquidity: '$24K',
+        volume: '$180K',‹        score: 91,
+        risk: 'Medium'
+      },
+      {
+        symbol: 'DAI',
+        name: 'DaiDai26',
+        liquidity: '$31K',
+        volume: '$420K',
+        score: 95,
+        risk: 'Low'
+      }
+    ]
+  });
+});
+  res.json({
+    ok: true,
+    lastRun,
+    config: {
+      interval: config.scanIntervalMinutes,
+      minLiq: config.minLiquidityUsd,
+      maxLiq: config.maxLiquidityUsd,
+      autoAlerts: config.enableAutoAlerts,
+      hasDiscord: Boolean(config.discordWebhookUrl),
+      hasHelius: Boolean(config.heliusApiKey)
     }
+  });
+});
+
+app.get('/api/tokens', (_, res) => {
+  const positions = readJson('positions');
+  const tokens = readJson('tokens').map(t => enhanceTokenForTrade(t, positions));
+  res.json(tokens);
+});
+
+app.get('/api/snapshots/:pair', (req, res) => {
+  res.json(
+    readJson('snapshots')
+      .filter(s => s.pairAddress === req.params.pair)
+      .slice(0, 150)
   );
+});
 
-  const data = await response.json();
-
-  if (!data.ok) {
-    console.log("Telegram error:", data);
-    return false;
+app.post('/api/scan', async (_, res) => {
+  try {
+    lastRun = await scanOnce();
+    res.json(lastRun);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
+});
 
-  console.log("Telegram sent:", token.symbol, token.score);
-  return true;
-}
-
-function ageMinutes(pair) {
-  if (!pair?.pairCreatedAt) return 999999;
-  return Math.max(1, Math.floor((Date.now() - pair.pairCreatedAt) / 60000));
-}
-
-function scorePair(pair) {
-  const liquidity = Number(pair?.liquidity?.usd || 0);
-  const volume = Number(pair?.volume?.h24 || 0);
-  const buys = Number(pair?.txns?.h24?.buys || 0);
-  const sells = Number(pair?.txns?.h24?.sells || 0);
-  const txns = buys + sells;
-  const change = Number(pair?.priceChange?.h24 || 0);
-  const age = ageMinutes(pair);
-  const volumeLiquidityRatio = liquidity > 0 ? volume / liquidity : 0;
-
-  let score = 0;
-
-  if (age <= 30) score += 25;
-  else if (age <= 120) score += 18;
-  else if (age <= 360) score += 10;
-  else score -= 15;
-
-  if (liquidity >= 15000 && liquidity <= 150000) score += 25;
-  else if (liquidity >= 5000 && liquidity <= 300000) score += 12;
-
-  if (volumeLiquidityRatio >= 3) score += 25;
-  else if (volumeLiquidityRatio >= 1.5) score += 18;
-  else if (volumeLiquidityRatio >= 1) score += 10;
-
-  if (txns >= 250) score += 15;
-  else if (txns >= 100) score += 10;
-  else if (txns >= 50) score += 5;
-
-  if (change > 10 && change < 250) score += 15;
-  else if (change > 0 && change < 400) score += 8;
-  else if (change >= 400) score -= 15;
-  else if (change <= -25) score -= 25;
-
-  if (buys > sells && buys + sells > 25) score += 5;
-
-  return Math.max(0, Math.min(score, 100));
-}
-
-function normalizePair(pair) {
-  const liquidity = Number(pair?.liquidity?.usd || 0);
-  const volume24h = Number(pair?.volume?.h24 || 0);
-  const priceChange = Number(pair?.priceChange?.h24 || 0);
-  const age = ageMinutes(pair);
-  const score = scorePair(pair);
-  const volumeLiquidityRatio =
-    liquidity > 0 ? Number((volume24h / liquidity).toFixed(2)) : 0;
-
-  return {
-    id: pair?.pairAddress || pair?.baseToken?.address || Math.random().toString(),
-    symbol: pair?.baseToken?.symbol || "UNKNOWN",
-    name: pair?.baseToken?.name || "Unknown Token",
-    chain: pair?.chainId || "unknown",
-    priceUsd: Number(pair?.priceUsd || 0),
-    liquidity,
-    volume24h,
-    volumeLiquidityRatio,
-    priceChange,
-    ageMinutes: age,
-    age: age === 999999 ? "Unknown" : `${age} min`,
-    score,
-    action: score >= 85 ? "STARTER" : score >= 60 ? "WATCH" : "AVOID",
-    confidence: score >= 85 ? "HIGH" : score >= 60 ? "MEDIUM" : "LOW",
-    rugSignal:
-      liquidity < 5000 || priceChange < -25 || priceChange > 500
-        ? "RED"
-        : score >= 75
-        ? "GREEN"
-        : "YELLOW",
-    setupType:
-      score >= 85
-        ? "Early Momentum"
-        : score >= 60
-        ? "Watchlist"
-        : "Avoid",
-    reason: `Liquidity $${Math.round(liquidity).toLocaleString()}, 24h volume $${Math.round(volume24h).toLocaleString()}, volume/liquidity ${volumeLiquidityRatio}x, age ${age} min, 24h change ${priceChange}%.`,
-    dexUrl: pair?.url || "https://dexscreener.com",
-    tokenAddress: pair?.baseToken?.address || null,
-    pairAddress: pair?.pairAddress || null
-  };
-}
-
-function shouldAlert(token) {
-  if (alerted.has(token.id)) return false;
-
-  return (
-    token.score >= SETTINGS.alertScore &&
-    token.liquidity >= SETTINGS.minLiquidity &&
-    token.liquidity <= SETTINGS.maxLiquidity &&
-    token.ageMinutes <= SETTINGS.maxAgeMinutes &&
-    token.volumeLiquidityRatio >= SETTINGS.minVolumeLiquidityRatio &&
-    token.rugSignal !== "RED"
+app.post('/api/test-alert', async (req, res) => {
+  res.json(
+    await sendDiscordAlert(
+      req.body || {
+        name: 'Test',
+        symbol: 'TEST',
+        score: 99,
+        riskLevel: 'LOW',
+        confidenceLevel: 'HIGH',
+        confidence: 95,
+        liquidityUsd: 100000,
+        volumeH1: 200000,
+        buyRatio: 0.7,
+        entryChecklist: {
+          passed: 8,
+          total: 8,
+          entryQuality: 'STARTER OK'
+        },
+        exitPressure: {
+          exitPressureLevel: 'LOW',
+          exitPressureScore: 10
+        },
+        positives: [{ text: 'Test alert from V5 works.' }],
+        dexUrl: 'https://dexscreener.com'
+      }
+    )
   );
-}
+});
 
-async function getLiveScannerResults() {
-  const searches = [
-    "pump",
-    "moon",
-    "solana meme",
-    "baby",
-    "dog",
-    "cat",
-    "ai",
-    "goat"
-  ];
+app.get('/api/portfolio-prices', async (_, res) => {
+  const prices = await getCryptoPrices([
+    'BTC',
+    'ETH',
+    'XRP',
+    'LINK',
+    'ARB',
+    'RENDER',
+    'SUI',
+    'AVAX',
+    'SOL'
+  ]);
 
-  const allPairs = [];
+  res.json(prices);
+});
 
-  for (const q of searches) {
-    try {
-      const res = await fetch(
-        `${DEX}/latest/dex/search?q=${encodeURIComponent(q)}`
-      );
-      const data = await res.json();
-      if (Array.isArray(data?.pairs)) allPairs.push(...data.pairs);
-    } catch (err) {
-      console.log("Dex search failed:", q, err.message);
-    }
+ 
+
+app.get('/api/wallets', (_, res) => res.json(readJson('wallets')));
+app.post('/api/wallets', (req, res) => res.json(upsert('wallets', req.body)));
+app.delete('/api/wallets/:id', (req, res) => {
+  writeJson('wallets', readJson('wallets').filter(x => x.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+app.get('/api/journal', (_, res) => res.json(readJson('journal')));
+app.post('/api/journal', (req, res) => res.json(upsert('journal', req.body)));
+app.delete('/api/journal/:id', (req, res) => {
+  writeJson('journal', readJson('journal').filter(x => x.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+app.get('/api/positions', (_, res) => {
+  const tokens = readJson('tokens');
+
+  const positions = readJson('positions').map(p => {
+    const token = tokens.find(
+      t =>
+        t.tokenAddress === p.tokenAddress ||
+        t.pairAddress === p.pairAddress ||
+        t.symbol === p.symbol
+    );
+
+    return {
+      ...p,
+      evaluation: token ? evaluatePosition(p, token) : null,
+      token
+    };
+  });
+
+  res.json(positions);
+});
+
+app.post('/api/positions', (req, res) => {
+  res.json(
+    upsert(
+      'positions',
+      req.body,
+      (a, b) =>
+        a.id === b.id ||
+        (b.tokenAddress && a.tokenAddress === b.tokenAddress) ||
+        (b.pairAddress && a.pairAddress === b.pairAddress)
+    )
+  );
+});
+
+app.delete('/api/positions/:id', (req, res) => {
+  writeJson('positions', readJson('positions').filter(x => x.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+app.get('/api/watchlist', (_, res) => res.json(readJson('watchlist')));
+app.post('/api/watchlist', (req, res) => {
+  res.json(
+    upsert(
+      'watchlist',
+      req.body,
+      (a, b) =>
+        a.id === b.id ||
+        a.tokenAddress === b.tokenAddress ||
+        a.pairAddress === b.pairAddress
+    )
+  );
+});
+
+app.delete('/api/watchlist/:id', (req, res) => {
+  writeJson('watchlist', readJson('watchlist').filter(x => x.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+app.get('/api/blacklist', (_, res) => res.json(readJson('blacklist')));
+app.post('/api/blacklist', (req, res) => {
+  res.json(
+    upsert(
+      'blacklist',
+      req.body,
+      (a, b) =>
+        a.id === b.id ||
+        a.tokenAddress === b.tokenAddress ||
+        a.pairAddress === b.pairAddress ||
+        a.symbol === b.symbol
+    )
+  );
+});
+
+app.delete('/api/blacklist/:id', (req, res) => {
+  writeJson('blacklist', readJson('blacklist').filter(x => x.id !== req.params.id));
+  res.json({ ok: true });
+});
+
+app.get('/api/alerts', (_, res) => res.json(readJson('alerts')));
+
+app.get('/api/settings', (_, res) => res.json(readJson('settings')));
+
+app.post('/api/settings', (req, res) => {
+  writeJson('settings', {
+    ...readJson('settings'),
+    ...req.body,
+    updatedAt: new Date().toISOString()
+  });
+
+  res.json(readJson('settings'));
+});
+
+cron.schedule(`*/${config.scanIntervalMinutes} * * * *`, async () => {
+  try {
+    lastRun = await scanOnce();
+    console.log('scan complete', lastRun.saved);
+  } catch (e) {
+    console.error('scan failed', e.message);
   }
+});
 
-  const unique = new Map();
+app.listen(config.port, '0.0.0.0', () => {
+  console.log(`Scanner API running on http://0.0.0.0:${config.port}`);
+});
+const express = require("express");
+const cors = require("cors");
 
-  for (const pair of allPairs) {
-    if (pair?.chainId !== "solana") continue;
-    if (!pair?.pairAddress) continue;
-    unique.set(pair.pairAddress, pair);
-  }
+const app = express();
+const PORT = 5050;
 
-  return [...unique.values()]
-    .map(normalizePair)
-    .filter(t => t.liquidity >= 5000)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 30);
-}
+app.use(cors());
+app.use(express.json());
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    status: 'API Online'
+  });
+});
+
+const watchlist = [];
+const blacklist = [];
+const journal = [];
+const positions = [];
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, status: "API Online", settings: SETTINGS });
+  res.json({
+    ok: true,
+    status: "API Online",
+    timestamp: new Date().toISOString(),
+  });
 });
-
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, status: "API Online", settings: SETTINGS });
-});
-
-app.get("/test-telegram", async (req, res) => {
-  try {
-    const sent = await sendTelegramAlert({
-      id: "test",
-      symbol: "TEST",
-      name: "Telegram Test",
-      score: 99,
-      action: "TEST",
-      rugSignal: "GREEN",
-      liquidity: 25000,
-      volume24h: 100000,
-      volumeLiquidityRatio: 4,
-      priceChange: 50,
-      age: "1 min",
-      reason: "Testing Telegram direct route.",
-      dexUrl: "https://dexscreener.com"
-    });
-
-    res.json({ ok: sent, message: sent ? "Telegram sent" : "Telegram failed" });
-  } catch (err) {
-    console.log("Test Telegram error:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-async function scanHandler(req, res) {
-  try {
-    const results = await getLiveScannerResults();
-
-    console.log("SCAN RESULTS:", results.length);
-    console.log("TOP:", results[0]?.symbol, results[0]?.score);
-
-    const alerts = [];
-
-    for (const token of results) {
-      if (shouldAlert(token)) {
-        const sent = await sendTelegramAlert(token);
-        if (sent) {
-          alerted.add(token.id);
-          alerts.push(token.symbol);
-        }
-      }
-    }
-
-    res.json({
-      ok: true,
-      count: results.length,
-      alertsSent: alerts,
-      results
-    });
-  } catch (err) {
-    console.log("Scan error:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-}
-
-app.post("/scan", scanHandler);
-app.post("/api/scan", scanHandler);
 
 app.get("/tokens", async (req, res) => {
-  const results = await getLiveScannerResults();
-  res.json(results);
+  res.json([
+    {
+      symbol: "SOL",
+      name: "Solana",
+      price: 184.22,
+      change24h: 8.4,
+      liquidity: 1240000,
+      volume24h: 8900000,
+      risk: "Low",
+      signal: "Bullish",
+    },
+    {
+      symbol: "BTC",
+      name: "Bitcoin",
+      price: 103240,
+      change24h: 3.8,
+      liquidity: 90000000,
+      volume24h: 42000000000,
+      risk: "Low",
+      signal: "Hold",
+    },
+    {
+      symbol: "ETH",
+      name: "Ethereum",
+      price: 3841,
+      change24h: 5.1,
+      liquidity: 62000000,
+      volume24h: 19000000000,
+      risk: "Low",
+      signal: "Bullish",
+    },
+  ]);
 });
 
-app.get("/api/tokens", async (req, res) => {
-  const results = await getLiveScannerResults();
-  res.json(results);
+app.get("/positions", (req, res) => {
+  res.json(positions);
 });
 
-app.get("/positions", (req, res) => res.json([]));
-app.get("/api/positions", (req, res) => res.json([]));
-app.get("/journal", (req, res) => res.json([]));
-app.get("/api/journal", (req, res) => res.json([]));
-app.get("/watchlist", (req, res) => res.json([]));
-app.get("/api/watchlist", (req, res) => res.json([]));
-app.get("/blacklist", (req, res) => res.json([]));
-app.get("/api/blacklist", (req, res) => res.json([]));
-app.get("/portfolio-prices", (req, res) => res.json({}));
-app.get("/api/portfolio-prices", (req, res) => res.json({}));
+app.get("/journal", (req, res) => {
+  res.json(journal);
+});
 
-app.listen(PORT, "0.0.0.0", () => {
+app.get("/watchlist", (req, res) => {
+  res.json(watchlist);
+});
+
+app.get("/blacklist", (req, res) => {
+  res.json(blacklist);
+});
+
+app.get("/portfolio-prices", (req, res) => {
+  res.json({
+    BTC: 103240,
+    ETH: 3841,
+    XRP: 1.5,
+    SOL: 184.22,
+    AVAX: 37.41,
+    LINK: 16.82,
+    ROVETAN: 0.00042,
+  });
+});
+
+app.post("/scan", async (req, res) => {
+  const results = [
+    {
+      name: "Solana Meme Coin",
+      symbol: "SMC",
+      chain: "Solana",
+      price: "$0.00042",
+      liquidity: 24500,
+      volume24h: 187000,
+      age: "42 min",
+      risk: "Medium",
+      score: 82,
+      signal: "Watch",
+      reason: "Liquidity entered target range with rising volume.",
+    },
+    {
+      name: "Pump Token",
+      symbol: "PUMP",
+      chain: "Solana",
+      price: "$0.000018",
+      liquidity: 18200,
+      volume24h: 94000,
+      age: "18 min",
+      risk: "High",
+      score: 71,
+      signal: "High Risk",
+      reason: "Early liquidity, strong volume, but very new token.",
+    },
+    {
+      name: "Runner",
+      symbol: "RUN",
+      chain: "Solana",
+      price: "$0.00091",
+      liquidity: 32800,
+      volume24h: 260000,
+      age: "1 hr",
+      risk: "Medium",
+      score: 86,
+      signal: "Momentum",
+      reason: "Volume surge with healthier liquidity.",
+    },
+  ];
+
+  res.json({
+    ok: true,
+    count: results.length,
+    results,
+  });
+});
+
+app.listen(PORT, () => {
   console.log(`Scanner API running on http://localhost:${PORT}`);
 });
-setInterval(async () => {
-  console.log("AUTO SCAN RUNNING...");
-  await scanHandler({}, {
-    json: () => {}
-  });
-}, 60000);
