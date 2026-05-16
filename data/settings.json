@@ -1,0 +1,21 @@
+{
+  "profitPlan": [
+    {
+      "gainPct": 50,
+      "sellPct": 25,
+      "note": "Lock partial profit."
+    },
+    {
+      "gainPct": 100,
+      "sellPct": 50,
+      "note": "Recover original investment."
+    },
+    {
+      "gainPct": 200,
+      "sellPct": 25,
+      "note": "Trim another piece."
+    }
+  ],
+  "maxLossPct": -25,
+  "defaultRiskUsd": 100
+}
