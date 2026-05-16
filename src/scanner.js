@@ -1,3 +1,4 @@
+import express from "express";
 import { config } from './config.js';
 import { fetchLatestSolanaPairs } from './dexscreener.js';
 import { getRugReport } from './rugcheck.js';
@@ -265,7 +266,6 @@ console.log("SENDING TELEGRAM ALERT", saved.symbol, saved.score);
     results: results.sort((a, b) => b.score - a.score),
     ts: new Date().toISOString()
   };
-import express from "express";
 
 const app = express();
 
