@@ -83,7 +83,7 @@ app.post('/scan', async (req, res) => {
   liquidity: '$24K',
   volume: '$180K',
   score: 91,
-  risk: 'Medium'
+  risk: 'Medium',
 },
         symbol: 'DAI',
         name: 'DaiDai26',
