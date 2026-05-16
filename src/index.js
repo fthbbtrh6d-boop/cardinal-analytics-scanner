@@ -49,14 +49,14 @@ app.post('/scan', async (req, res) => {
     res.json({
       success: true,
       results: [
-        {
-          symbol: 'RVT',
-          name: 'Rovetan',
-          liquidity: '$24K',
-          volume: '$180K',
-          score: 91,
-          risk: 'Medium',
-        },
+    {
+  symbol: 'RVT',
+  name: 'Rovetan',
+  liquidity: '$24K',
+  volume: '$180K',
+  score: 91,
+  risk: 'Medium',
+},
         {
           symbol: 'DAI',
           name: 'DaiDai26',
